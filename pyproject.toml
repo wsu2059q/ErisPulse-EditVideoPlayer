@@ -1,0 +1,19 @@
+[project]
+name = "ErisPulse-EditVideoPlayer"
+version = "1.0.0"
+description = "一个通用的视频播放器模块，可将视频转换为点阵字符并在支持消息编辑的平台上播放"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [ { name = "wsu2059q", email = "wsu2059@qq.com" } ]
+
+dependencies = [
+    "opencv-python>=4.5.0",
+    "aiofiles>=0.8.0"
+]
+
+[project.urls]
+"homepage" = "https://github.com/wsu2059q/ErisPulse-EditVideoPlayer"
+
+[project.entry-points."erispulse.module"]
+"EditVideoPlayer" = "ErisPulse_EditVideoPlayer:Main"
