@@ -6,6 +6,8 @@ import aiofiles
 from typing import Optional
 from fastapi import UploadFile, File, Depends, HTTPException, Header, Request
 from .video_converter import VideoConverter
+from collections import defaultdict
+from datetime import datetime, timedelta
 
 
 class Main:
@@ -27,6 +29,11 @@ class Main:
 
         # 存储活跃会话
         self.active_sessions = {}
+        
+        # IP上传限制相关属性
+        self.ip_upload_limits = defaultdict(list)  # 存储IP上传记录
+        self.max_concurrent_uploads_per_ip = 3  # 同一IP最大并发上传数
+        self.upload_time_window = 3600  # 1小时内的时间窗口
 
         self.logger.info("EditVideoPlayer模块已加载")
 
@@ -38,7 +45,9 @@ class Main:
                 "video_directory": "videos",
                 "fps": 30,
                 "braille_width": 60,
-                "braille_height": 30
+                "braille_height": 30,
+                "max_file_size_mb": 50,  # 最大文件大小(MB)
+                "max_concurrent_uploads_per_ip": 3  # 同IP最大并发上传数
             }
             self.sdk.config.setConfig("EditVideoPlayer", config)
             self.logger.warning("已创建默认配置，请在 config.toml 中修改 EditVideoPlayer 配置")
@@ -49,6 +58,9 @@ class Main:
         # 添加新的配置项
         self.braille_width = config.get("braille_width", 60)
         self.braille_height = config.get("braille_height", 30)
+        # 文件上传限制配置
+        self.max_file_size = config.get("max_file_size_mb", 50) * 1024 * 1024
+        self.max_concurrent_uploads_per_ip = config.get("max_concurrent_uploads_per_ip", 3)
         
         # 更新视频转换器的尺寸配置
         self.converter.width = self.braille_width
@@ -88,6 +100,33 @@ class Main:
         
         return verify_api_key
 
+    def _check_ip_upload_limit(self, client_ip: str) -> bool:
+        """
+        检查指定IP是否超过并发上传限制
+        """
+        now = datetime.now()
+        # 清理1小时前的记录
+        self.ip_upload_limits[client_ip] = [
+            timestamp for timestamp in self.ip_upload_limits[client_ip]
+            if now - timestamp < timedelta(seconds=self.upload_time_window)
+        ]
+        
+        # 检查当前并发上传数
+        return len(self.ip_upload_limits[client_ip]) < self.max_concurrent_uploads_per_ip
+    
+    def _add_ip_upload_record(self, client_ip: str):
+        """
+        记录IP开始上传
+        """
+        self.ip_upload_limits[client_ip].append(datetime.now())
+    
+    def _remove_ip_upload_record(self, client_ip: str):
+        """
+        移除IP上传记录
+        """
+        if self.ip_upload_limits[client_ip]:
+            self.ip_upload_limits[client_ip].pop(0)
+
     def _register_routes(self):
         # 创建API密钥依赖
         api_key_dep = self._get_api_key_dependency()
@@ -99,20 +138,56 @@ class Main:
         ):
             client_ip = request.client.host
             try:
-                file_path = os.path.join(self.video_dir, file.filename)
+                # 检查文件大小
+                file_size = 0
+                if hasattr(file, 'size'):
+                    file_size = file.size
+                elif hasattr(file, 'file') and hasattr(file.file, 'seek'):
+                    # 获取文件大小
+                    pos = file.file.tell()
+                    file.file.seek(0, 2)  # 移动到文件末尾
+                    file_size = file.file.tell()
+                    file.file.seek(pos)  # 恢复原位置
+                
+                if file_size > self.max_file_size:
+                    self.logger.warning(f"文件大小超过限制: {file_size} bytes (IP: {client_ip})")
+                    return {
+                        "status": "error",
+                        "message": f"文件大小超过限制，最大允许 {self.max_file_size // (1024*1024)}MB"
+                    }
+                
+                # 检查并发上传限制
+                if not self._check_ip_upload_limit(client_ip):
+                    self.logger.warning(f"IP {client_ip} 超过并发上传限制")
+                    return {
+                        "status": "error",
+                        "message": "您有太多文件正在上传，请等待部分上传完成后再试"
+                    }
+                
+                # 记录开始上传
+                self._add_ip_upload_record(client_ip)
+                
+                try:
+                    file_path = os.path.join(self.video_dir, file.filename)
 
-                # 保存文件
-                async with aiofiles.open(file_path, 'wb') as out_file:
-                    content = await file.read()
-                    await out_file.write(content)
+                    # 保存文件
+                    async with aiofiles.open(file_path, 'wb') as out_file:
+                        content = await file.read()
+                        await out_file.write(content)
 
-                self.logger.info(f"视频文件已上传: {file.filename} (IP: {client_ip})")
-                return {
-                    "status": "success",
-                    "message": f"视频 {file.filename} 上传成功",
-                    "filename": file.filename
-                }
+                    self.logger.info(f"视频文件已上传: {file.filename} (IP: {client_ip})")
+                    return {
+                        "status": "success",
+                        "message": f"视频 {file.filename} 上传成功",
+                        "filename": file.filename
+                    }
+                finally:
+                    # 移除上传记录
+                    self._remove_ip_upload_record(client_ip)
+                    
             except Exception as e:
+                # 确保即使出错也移除上传记录
+                self._remove_ip_upload_record(client_ip)
                 self.logger.error(f"上传视频失败: {str(e)} (IP: {client_ip})")
                 return {
                     "status": "error",
@@ -338,7 +413,7 @@ class Main:
                 self.logger.error(f"无法获取消息ID，无法播放视频 {video_name}。返回结果: {initial_msg_result}")
                 # 尝试发送错误消息
                 try:
-                    await adapter.Send.To(target_type, target_id).Text("播放失败：无法获取消息ID")
+                    adapter.Send.To(target_type, target_id).Text("播放失败：无法获取消息ID")
                 except:
                     pass
                 return
@@ -357,7 +432,7 @@ class Main:
             
             async for frame in self.converter.convert_video_to_braille(video_path):
                 try:
-                    await adapter.Send.To(target_type, target_id).Edit(msg_id, frame)
+                    adapter.Send.To(target_type, target_id).Edit(msg_id, frame)
                     frame_count += 1
                     # 每播放10帧记录一次日志
                     if frame_count % 10 == 0:
@@ -369,7 +444,7 @@ class Main:
                     break
 
             # 发送结束消息
-            await adapter.Send.To(target_type, target_id).Edit(msg_id, "视频播放结束")
+            adapter.Send.To(target_type, target_id).Edit(msg_id, "视频播放结束")
             self.logger.info(f"视频 {video_name} 播放完成，共播放 {frame_count} 帧")
             
             # 播放完成后从活跃会话中移除
@@ -382,7 +457,7 @@ class Main:
             self.logger.error(f"播放视频任务失败: {str(e)} (视频: {video_name})", exc_info=True)
             try:
                 adapter = self.sdk.adapter.get(platform)
-                await adapter.Send.To(target_type, target_id).Text(f"播放视频时出错: {str(e)}")
+                adapter.Send.To(target_type, target_id).Text(f"播放视频时出错: {str(e)}")
             except Exception as send_error:
                 self.logger.error(f"发送错误消息失败: {str(send_error)}")
             
@@ -403,7 +478,7 @@ class Main:
     async def send_message(self, platform: str, target_type: str, target_id: str, message: str):
         try:
             adapter = self.sdk.adapter.get(platform)
-            await adapter.Send.To(target_type, target_id).Text(message)
+            adapter.Send.To(target_type, target_id).Text(message)
             self.logger.debug(f"向 {platform} 平台的 {target_type} {target_id} 发送消息: {message}")
         except Exception as e:
             self.logger.error(f"发送消息失败: {str(e)}")
