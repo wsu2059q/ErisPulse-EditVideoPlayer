@@ -1,6 +1,6 @@
 [project]
 name = "ErisPulse-EditVideoPlayer"
-version = "1.0.1"
+version = "1.2.0"
 description = "一个通用的视频播放器模块，可将视频转换为点阵字符并在支持消息编辑的平台上播放"
 readme = "README.md"
 requires-python = ">=3.9"
