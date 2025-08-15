@@ -1,9 +1,9 @@
 from ErisPulse import sdk
 import os
-import time
 import asyncio
 import aiofiles
-from typing import Optional
+import shlex
+from typing import Optional, List, Dict, Any
 from fastapi import UploadFile, File, Depends, HTTPException, Header, Request
 from .video_converter import VideoConverter
 from collections import defaultdict
@@ -41,23 +41,24 @@ class Main:
         config = self.sdk.config.getConfig("EditVideoPlayer")
         if not config:
             config = {
-                "api_key": "your-secret-api-key",
-                "video_directory": "videos",
-                "fps": 30,
-                "braille_width": 60,
-                "braille_height": 30,
-                "max_file_size_mb": 50,  # 最大文件大小(MB)
-                "max_concurrent_uploads_per_ip": 3  # 同IP最大并发上传数
+                "api_key": "your-secret-api-key",   # 访问密钥
+                "video_directory": "videos",        # 默认视频目录
+                "braille_width": 60,                # 默认 braille 宽度
+                "braille_height": 30,               # 默认 braille 高度
+                "max_file_size_mb": 50,             # 默认文件上传限制
+                "max_concurrent_uploads_per_ip": 3, # 同一IP最大并发上传数
+                "max_frame_rate": 10                # 最大帧率
             }
             self.sdk.config.setConfig("EditVideoPlayer", config)
             self.logger.warning("已创建默认配置，请在 config.toml 中修改 EditVideoPlayer 配置")
         
         self.api_key = config.get("api_key", "your-secret-api-key")
         self.video_dir = config.get("video_directory", "videos")
-        self.fps = config.get("fps", 30)
-        # 添加新的配置项
+
         self.braille_width = config.get("braille_width", 60)
         self.braille_height = config.get("braille_height", 30)
+        self.max_frame_rate = config.get("max_frame_rate", 10)
+        
         # 文件上传限制配置
         self.max_file_size = config.get("max_file_size_mb", 50) * 1024 * 1024
         self.max_concurrent_uploads_per_ip = config.get("max_concurrent_uploads_per_ip", 3)
@@ -67,10 +68,20 @@ class Main:
         self.converter.height = self.braille_height
 
     @staticmethod
-    def should_eager_load():
+    def should_eager_load() -> bool:
+        """
+        指定模块是否应立即加载
+        
+        :return: True 表示应立即加载
+        """
         return True
 
     def _get_api_key_dependency(self):
+        """
+        创建API密钥验证依赖
+        
+        :return: 验证函数
+        """
         async def verify_api_key(request: Request, authorization: str = Header(None)):
             client_ip = request.client.host
             if not self.api_key or self.api_key == "your-secret-api-key":
@@ -102,7 +113,10 @@ class Main:
 
     def _check_ip_upload_limit(self, client_ip: str) -> bool:
         """
-        检查指定IP是否超过并发上传限制
+        检查IP上传限制
+        
+        :param client_ip: 客户端IP地址
+        :return: 是否允许上传
         """
         now = datetime.now()
         # 清理1小时前的记录
@@ -116,16 +130,65 @@ class Main:
     
     def _add_ip_upload_record(self, client_ip: str):
         """
-        记录IP开始上传
+        添加IP上传记录
+        
+        :param client_ip: 客户端IP地址
         """
         self.ip_upload_limits[client_ip].append(datetime.now())
     
     def _remove_ip_upload_record(self, client_ip: str):
         """
         移除IP上传记录
+        
+        :param client_ip: 客户端IP地址
         """
         if self.ip_upload_limits[client_ip]:
             self.ip_upload_limits[client_ip].pop(0)
+
+    def _get_video_list(self) -> List[Dict[str, Any]]:
+        """
+        获取视频列表
+        
+        :return: 视频信息列表
+        """
+        videos = []
+        if os.path.exists(self.video_dir):
+            for file in os.listdir(self.video_dir):
+                if file.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                    file_path = os.path.join(self.video_dir, file)
+                    stat = os.stat(file_path)
+                    videos.append({
+                        "filename": file,
+                        "size": stat.st_size,
+                        "modified": stat.st_mtime
+                    })
+        return videos
+
+    def _get_video_by_index(self, index: int) -> Optional[str]:
+        """
+        根据序号获取视频文件名
+        
+        :param index: 视频序号（从1开始）
+        :return: 视频文件名或None
+        """
+        videos = self._get_video_list()
+        if 1 <= index <= len(videos):
+            return videos[index - 1]["filename"]
+        return None
+
+    def _is_platform_supported(self, platform: str) -> bool:
+        """
+        检查平台是否支持消息编辑功能
+        
+        :param platform: 平台名称
+        :return: 是否支持
+        """
+        try:
+            adapter = self.sdk.adapter.get(platform)
+            return hasattr(adapter.Send, 'Edit')
+        except Exception as e:
+            self.logger.error(f"检查平台支持性时出错: {str(e)}")
+            return False
 
     def _register_routes(self):
         # 创建API密钥依赖
@@ -136,6 +199,14 @@ class Main:
             file: UploadFile = File(...),
             api_key_valid: bool = Depends(api_key_dep)
         ):
+            """
+            上传视频文件
+            
+            :param request: HTTP请求对象
+            :param file: 上传的文件
+            :param api_key_valid: API密钥验证结果
+            :return: 上传结果
+            """
             client_ip = request.client.host
             try:
                 # 检查文件大小
@@ -195,19 +266,16 @@ class Main:
                 }
 
         async def list_videos(request: Request, api_key_valid: bool = Depends(api_key_dep)):
+            """
+            列出所有视频文件
+            
+            :param request: HTTP请求对象
+            :param api_key_valid: API密钥验证结果
+            :return: 视频列表
+            """
             client_ip = request.client.host
             try:
-                videos = []
-                if os.path.exists(self.video_dir):
-                    for file in os.listdir(self.video_dir):
-                        if file.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
-                            file_path = os.path.join(self.video_dir, file)
-                            stat = os.stat(file_path)
-                            videos.append({
-                                "filename": file,
-                                "size": stat.st_size,
-                                "modified": stat.st_mtime
-                            })
+                videos = self._get_video_list()
 
                 self.logger.info(f"列出视频列表 (IP: {client_ip})")
                 return {
@@ -227,8 +295,23 @@ class Main:
             platform: str, 
             target_type: str, 
             target_id: str,
+            width: int = None,
+            height: int = None,
             api_key_valid: bool = Depends(api_key_dep)
         ):
+            """
+            播放指定视频
+            
+            :param request: HTTP请求对象
+            :param video_name: 视频文件名
+            :param platform: 平台名称
+            :param target_type: 目标类型
+            :param target_id: 目标ID
+            :param width: 播放宽度
+            :param height: 播放高度
+            :param api_key_valid: API密钥验证结果
+            :return: 播放结果
+            """
             client_ip = request.client.host
             try:
                 # 检查平台是否支持编辑消息
@@ -248,12 +331,13 @@ class Main:
                         "message": f"视频文件 {video_name} 不存在"
                     }
 
-                self.logger.info(f"开始播放视频 {video_name} 在 {platform} 平台 (IP: {client_ip})")
-                asyncio.create_task(self._play_video_task(video_path, platform, target_type, target_id))
+                self.logger.info(f"开始播放视频 {video_name} 在 {platform} 平台 (尺寸: {width}x{height})")
+                asyncio.create_task(self._play_video_task(video_path, platform, target_type, target_id, width, height))
 
+                size_info = f" ({width}x{height})" if width and height else ""
                 return {
                     "status": "success",
-                    "message": f"开始播放视频 {video_name} 在 {platform} 平台"
+                    "message": f"开始播放视频 {video_name}{size_info} 在 {platform} 平台"
                 }
             except Exception as e:
                 self.logger.error(f"播放视频失败: {str(e)} (IP: {client_ip})")
@@ -285,6 +369,11 @@ class Main:
 
         @self.sdk.adapter.on("message")
         async def handle_command(data):
+            """
+            处理视频播放命令
+            
+            :param data: 消息数据
+            """
             message = data.get("alt_message", "")
             if message.startswith("/video"):
                 await self._handle_video_command(data)
@@ -292,6 +381,11 @@ class Main:
         self.logger.info("模块路由注册完成")
 
     async def _handle_video_command(self, data):
+        """
+        处理视频命令
+        
+        :param data: 消息数据
+        """
         try:
             platform = data.get("platform")
             detail_type = data.get("detail_type")
@@ -302,26 +396,48 @@ class Main:
             self.logger.info(f"用户 {user_id} 在 {platform} 平台触发了视频命令")
 
             message = data.get("alt_message", "").strip()
-            parts = message.split()
+            
+            if message == "/video":
+                self.logger.info(f"用户 {user_id} 请求了视频命令帮助")
+                await self.send_message(platform, target_type, target_id, 
+                                      "用法: /video <命令> [参数]\n"
+                                      "可用命令:\n"
+                                      "  list - 列出所有可用视频（带序号）\n"
+                                      "  stop - 停止当前播放\n"
+                                      "  play <文件名或序号> [宽度] [高度] - 播放指定视频\n"
+                                      "提示：可以使用 /video list 查看视频列表和对应序号")
+                return
+
+            # 使用 shlex.split 来正确处理引号
+            try:
+                parts = shlex.split(message)
+            except ValueError as e:
+                await self.send_message(platform, target_type, target_id, 
+                                      "命令格式错误，请检查引号是否匹配")
+                return
 
             if len(parts) < 2:
                 self.logger.info(f"用户 {user_id} 请求了视频命令帮助")
                 await self.send_message(platform, target_type, target_id, 
-                                      "用法: /video <命令> [参数]\n可用命令: list, stop, play <文件名>")
+                                      "用法: /video <命令> [参数]\n"
+                                      "可用命令:\n"
+                                      "  list - 列出所有可用视频（带序号）\n"
+                                      "  stop - 停止当前播放\n"
+                                      "  play <文件名或序号> [宽度] [高度] - 播放指定视频\n"
+                                      "提示：可以使用 /video list 查看视频列表和对应序号")
                 return
 
             command = parts[1]
 
             if command == "list":
                 self.logger.info(f"用户 {user_id} 请求列出视频")
-                videos = []
-                if os.path.exists(self.video_dir):
-                    for file in os.listdir(self.video_dir):
-                        if file.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
-                            videos.append(file)
-
+                videos = self._get_video_list()
+                
                 if videos:
-                    video_list = "\n".join(videos)
+                    video_list_items = []
+                    for i, video in enumerate(videos, 1):
+                        video_list_items.append(f"{i}. {video['filename']}")
+                    video_list = "\n".join(video_list_items)
                     await self.send_message(platform, target_type, target_id, 
                                           f"可用视频:\n{video_list}")
                 else:
@@ -329,14 +445,52 @@ class Main:
                                           "没有找到可用视频")
 
             elif command == "play":
-                play_command = message[len("/video play "):].strip()
-                if not play_command:
-                    self.logger.info(f"用户 {user_id} 请求播放视频但未提供文件名")
+                if len(parts) < 3:
+                    self.logger.info(f"用户 {user_id} 请求播放视频但未提供文件名或序号")
                     await self.send_message(platform, target_type, target_id, 
-                                          "用法: /video play <文件名>")
+                                          "用法: /video play <文件名或序号> [宽度] [高度]\n"
+                                          "提示：文件名如果有空格，需要用引号包裹")
                     return
 
-                video_name = play_command
+                # 获取视频标识（文件名或序号）
+                video_identifier = parts[2]
+                video_name = None
+                
+                # 判断是序号还是文件名
+                if video_identifier.isdigit():
+                    # 是数字，尝试作为序号处理
+                    index = int(video_identifier)
+                    video_name = self._get_video_by_index(index)
+                    if not video_name:
+                        await self.send_message(platform, target_type, target_id, 
+                                              f"无效的视频序号: {index}，请使用 /video list 查看可用视频")
+                        return
+                else:
+                    # 不是数字，作为文件名处理
+                    video_name = video_identifier
+                    # 检查文件是否存在
+                    video_path = os.path.join(self.video_dir, video_name)
+                    if not os.path.exists(video_path):
+                        self.logger.warning(f"视频文件 {video_name} 不存在，用户 {user_id} 尝试播放")
+                        await self.send_message(platform, target_type, target_id, 
+                                              f"视频文件 {video_name} 不存在")
+                        return
+
+                # 解析可选的宽度和高度参数
+                width = None
+                height = None
+                if len(parts) >= 5:
+                    try:
+                        width = int(parts[3])
+                        height = int(parts[4])
+                        # 限制尺寸范围，防止过大
+                        width = max(10, min(width, 100))
+                        height = max(5, min(height, 50))
+                    except ValueError:
+                        await self.send_message(platform, target_type, target_id, 
+                                              "宽度和高度必须是数字")
+                        return
+
                 if not self._is_platform_supported(platform):
                     self.logger.warning(f"平台 {platform} 不支持消息编辑功能，用户 {user_id} 尝试播放视频")
                     await self.send_message(platform, target_type, target_id, 
@@ -350,10 +504,12 @@ class Main:
                                           f"视频文件 {video_name} 不存在")
                     return
 
-                self.logger.info(f"用户 {user_id} 开始播放视频: {video_name}")
-                asyncio.create_task(self._play_video_task(video_path, platform, target_type, target_id))
+                self.logger.info(f"用户 {user_id} 开始播放视频: {video_name} (尺寸: {width}x{height})")
+                # 传递宽度和高度参数
+                asyncio.create_task(self._play_video_task(video_path, platform, target_type, target_id, width, height))
+                size_info = f" ({width}x{height})" if width and height else ""
                 await self.send_message(platform, target_type, target_id, 
-                                      f"开始播放视频: {video_name}")
+                                      f"开始播放视频: {video_name}{size_info}")
                                       
             elif command == "stop":
                 session_key = f"{platform}_{target_type}_{target_id}"
@@ -376,14 +532,28 @@ class Main:
             else:
                 self.logger.warning(f"用户 {user_id} 使用了未知命令: {command}")
                 await self.send_message(platform, target_type, target_id, 
-                                      "未知命令。可用命令: list, stop, play <文件名>")
+                                      "未知命令。可用命令:\n"
+                                      "  list - 列出所有可用视频（带序号）\n"
+                                      "  stop - 停止当前播放\n"
+                                      "  play <文件名或序号> [宽度] [高度] - 播放指定视频")
 
         except Exception as e:
             self.logger.error(f"处理视频命令失败: {str(e)}", exc_info=True)
             await self.send_message(platform, target_type, target_id, 
                                   f"处理命令时出错: {str(e)}")
 
-    async def _play_video_task(self, video_path: str, platform: str, target_type: str, target_id: str):
+    async def _play_video_task(self, video_path: str, platform: str, target_type: str, target_id: str, 
+                               width: int = None, height: int = None):
+        """
+        视频播放任务
+        
+        :param video_path: 视频文件路径
+        :param platform: 平台名称
+        :param target_type: 目标类型
+        :param target_id: 目标ID
+        :param width: 播放宽度
+        :param height: 播放高度
+        """
         session_key = f"{platform}_{target_type}_{target_id}"
         user_info = f"用户 {target_id}" if target_type == "user" else f"群组 {target_id}"
         video_name = os.path.basename(video_path)
@@ -426,22 +596,52 @@ class Main:
                 self.active_sessions[session_key] = set()
             self.active_sessions[session_key].add(current_task)
 
+            # 保存原始尺寸设置
+            original_width = self.converter.width
+            original_height = self.converter.height
+            
+            # 如果用户指定了尺寸，则临时修改
+            if width and height:
+                self.converter.width = width
+                self.converter.height = height
+
+            # 获取视频帧率
+            video_fps, _a, _b = self.converter.get_video_info(video_path)
+            self.logger.info(f"视频 {video_name} 的帧率为 {video_fps} FPS")
+            
+            # 计算发送帧间隔
+            send_fps = min(video_fps, self.max_frame_rate)
+            sleep_time = 1.0 / send_fps
+            
+            self.logger.info(f"将以 {send_fps} FPS 的速度播放视频（原始帧率 {video_fps} FPS）")
+
             # 使用视频转换器播放视频
             frame_count = 0
-            sleep_time = 1.0 / self.fps if self.fps > 0 else 0.033
+            last_frame_content = None  # 记录上一帧内容
             
             async for frame in self.converter.convert_video_to_braille(video_path):
                 try:
-                    adapter.Send.To(target_type, target_id).Edit(msg_id, frame)
-                    frame_count += 1
-                    # 每播放10帧记录一次日志
-                    if frame_count % 10 == 0:
-                        self.logger.debug(f"视频 {video_name} 已播放 {frame_count} 帧")
+                    # 只有当帧内容不同时才发送
+                    if frame != last_frame_content:
+                        adapter.Send.To(target_type, target_id).Edit(msg_id, frame)
+                        last_frame_content = frame
+                        frame_count += 1
+                        # 每播放10帧记录一次日志
+                        if frame_count % 10 == 0:
+                            self.logger.debug(f"视频 {video_name} 已播放 {frame_count} 帧")
+                    else:
+                        self.logger.debug(f"跳过发送重复帧 {frame_count}")
+                    
                     # 控制播放速度
                     await asyncio.sleep(sleep_time)
                 except Exception as e:
                     self.logger.error(f"编辑消息失败: {str(e)} (视频: {video_name})", exc_info=True)
                     break
+
+            # 恢复原始尺寸设置
+            if width and height:
+                self.converter.width = original_width
+                self.converter.height = original_height
 
             # 发送结束消息
             adapter.Send.To(target_type, target_id).Edit(msg_id, "视频播放结束")
@@ -467,15 +667,15 @@ class Main:
                 if not self.active_sessions[session_key]:
                     del self.active_sessions[session_key]
 
-    def _is_platform_supported(self, platform: str) -> bool:
-        try:
-            adapter = self.sdk.adapter.get(platform)
-            return hasattr(adapter.Send, 'Edit')
-        except Exception as e:
-            self.logger.error(f"检查平台支持性时出错: {str(e)}")
-            return False
-
     async def send_message(self, platform: str, target_type: str, target_id: str, message: str):
+        """
+        发送消息
+        
+        :param platform: 平台名称
+        :param target_type: 目标类型
+        :param target_id: 目标ID
+        :param message: 消息内容
+        """
         try:
             adapter = self.sdk.adapter.get(platform)
             adapter.Send.To(target_type, target_id).Text(message)

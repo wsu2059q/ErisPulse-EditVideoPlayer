@@ -1,14 +1,16 @@
 # ErisPulse-EditVideoPlayer
+> ErisPulse 模块
 
 一个通用的视频播放器模块，可将视频转换为点阵字符并在支持消息编辑的平台上播放。
 
 ## 功能特性
+将视频转换为点阵字符并使用编辑消息的方式在平台进行视频播放
 
 - 上传和管理视频文件
-- 将视频转换为盲文点阵字符
-- 在支持消息编辑的平台上播放视频
-- 支持命令行和 HTTP API 控制
-- 自适应移动端显示比例
+- HTTP API 支持
+- 动态帧率，跳帧控制
+- 支持自定义播放画布尺寸
+- 支持通过序号播放视频
 
 ## 安装
 
@@ -26,9 +28,11 @@ epsdk install EditVideoPlayer
 [EditVideoPlayer]
 api_key = "your-secret-api-key"     # API密钥，用于保护HTTP接口
 video_directory = "videos"          # 视频存储目录
-fps = 30                            # 默认播放帧率
 braille_width = 60                  # 盲文字符宽度(字符数)
 braille_height = 30                 # 盲文字符高度(字符数)
+max_file_size_mb = 50               # 最大文件大小(MB)
+max_concurrent_uploads_per_ip = 3   # 同IP最大并发上传数
+max_frame_rate = 10                 # 每秒最大发送帧数（防止触发平台调用上限）
 ```
 
 首次运行时会自动创建默认配置。
@@ -38,9 +42,18 @@ braille_height = 30                 # 盲文字符高度(字符数)
 ### 命令控制
 
 ```
-/video list              # 列出所有可用视频
-/video play <文件名>     # 播放指定视频
-/video stop              # 停止当前播放的视频
+/video list                                    # 列出所有可用视频（带序号）
+/video play <文件名或序号> [宽度] [高度]         # 播放指定视频，可选自定义画布尺寸
+/video stop                                    # 停止当前播放的视频
+```
+
+示例：
+```
+/video list                                    # 查看视频列表和对应序号
+/video play sample.mp4                         # 通过文件名以默认尺寸播放视频
+/video play sample.mp4 50 25                   # 通过文件名以50x25字符尺寸播放视频
+/video play 1                                  # 通过序号播放列表中的第一个视频
+/video play 2 50 25                            # 通过序号以50x25字符尺寸播放视频
 ```
 
 ### HTTP API
@@ -93,10 +106,12 @@ Content-Type: application/json
 
 参数:
 {
-  "video_name": "要播放的视频文件名",
+  "video_name": "要播放的视频文件名或序号",
   "platform": "平台名称",
   "target_type": "目标类型（user/group）",
-  "target_id": "目标ID"
+  "target_id": "目标ID",
+  "width": 50,        # 可选，自定义画布宽度(字符数)
+  "height": 25        # 可选，自定义画布高度(字符数)
 }
 
 返回:
@@ -116,3 +131,14 @@ Content-Type: application/json
 ### 文件上传问题
 - 检查服务器磁盘空间
 - 验证文件大小限制
+
+## 致谢
+
+模块部分代码灵感/参考自：https://github.com/MarisaDAZA/yhBot 欢迎去点个star支持一下！
+
+---
+
+### 参考链接
+
+- [ErisPulse 主库](https://github.com/ErisPulse/ErisPulse/)
+- [ErisPulse 文档](https://www.erisdev.com/#docs/quick-start)
